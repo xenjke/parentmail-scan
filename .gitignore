@@ -1,0 +1,10 @@
+# Never commit runtime secrets or state
+.env
+*.sqlite3
+*.sqlite3-*
+parentmail-state/
+attachments/
+browser-profile*/
+__pycache__/
+.pytest_cache/
+*.pyc
