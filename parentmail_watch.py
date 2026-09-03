@@ -12,11 +12,25 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 LOGIN_URL = "https://parents.parentmail.co.uk/auth/login"
 PORTAL_URL = "https://parents.parentmail.co.uk/messages"
-DB = Path("/opt/data/parentmail/messages.sqlite3")
-PROFILE = Path("/opt/data/parentmail/browser-profile-v2")
-ATTACHMENTS = Path("/opt/data/parentmail/attachments")
+
+
+def default_data_dir() -> Path:
+    return Path(__file__).resolve().parent / ".local" / "parentmail"
+
+
+DATA_DIR = Path(os.environ.get("PARENTMAIL_DATA_DIR", str(default_data_dir())))
+DB = Path(os.environ.get("PARENTMAIL_DB_PATH", str(DATA_DIR / "messages.sqlite3")))
+PROFILE = Path(os.environ.get("PARENTMAIL_PROFILE_DIR", str(DATA_DIR / "browser-profile-v2")))
+ATTACHMENTS = Path(os.environ.get("PARENTMAIL_ATTACHMENTS_DIR", str(DATA_DIR / "attachments")))
 EMAIL = os.environ.get("PARENTMAIL_EMAIL")
 PASSWORD = os.environ.get("PARENTMAIL_PASSWORD")
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def now():
@@ -72,10 +86,11 @@ def extract_message(item: dict[str, Any], school_id: str | None) -> dict[str, An
 def login_and_collect(refresh_attachments=False):
     if not EMAIL or not PASSWORD:
         raise RuntimeError("PARENTMAIL_EMAIL/PARENTMAIL_PASSWORD are not available")
+    headless = env_bool("PARENTMAIL_HEADLESS", True)
     PROFILE.mkdir(parents=True, exist_ok=True); PROFILE.chmod(0o700)
     with sync_playwright() as p:
         exe = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH")
-        browser = p.chromium.launch_persistent_context(str(PROFILE), headless=True, executable_path=exe or None,
+        browser = p.chromium.launch_persistent_context(str(PROFILE), headless=headless, executable_path=exe or None,
             accept_downloads=True, viewport={"width":1280,"height":900})
         page = browser.pages[0] if browser.pages else browser.new_page()
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
@@ -186,6 +201,7 @@ def login_and_collect(refresh_attachments=False):
 
 def persist(responses, attachments=None, dry_run=False):
     attachments = attachments or []
+    DB.parent.mkdir(parents=True, exist_ok=True)
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; init_db(c)
     parsed=[]; seen=set(); school=None
     for resp in responses:
