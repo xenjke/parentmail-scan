@@ -25,11 +25,18 @@ ATTACHMENTS = Path(os.environ.get("PARENTMAIL_ATTACHMENTS_DIR", str(DATA_DIR / "
 EMAIL = os.environ.get("PARENTMAIL_EMAIL")
 PASSWORD = os.environ.get("PARENTMAIL_PASSWORD")
 DEBUG = os.environ.get("PARENTMAIL_DEBUG") == "1"
+CURRENT_PHASE = "startup"
 
 
 def debug(message: str):
     if DEBUG:
         print("DEBUG", message, flush=True)
+
+
+def phase(name: str):
+    global CURRENT_PHASE
+    CURRENT_PHASE = name
+    debug(f"phase={name}")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -103,6 +110,7 @@ def login_and_collect(refresh_attachments=False, _recovered=False):
 def _login_and_collect(refresh_attachments=False):
     if not EMAIL or not PASSWORD:
         raise RuntimeError("PARENTMAIL_EMAIL/PARENTMAIL_PASSWORD are not available")
+    phase("configuration")
     headless = env_bool("PARENTMAIL_HEADLESS", True)
     debug(f"config data_dir={DATA_DIR} db={DB} profile={PROFILE} headless={headless}")
     PROFILE.mkdir(parents=True, exist_ok=True); PROFILE.chmod(0o700)
@@ -116,11 +124,13 @@ def _login_and_collect(refresh_attachments=False):
             if "/api/v1.9/ss/v1/guardians/login" in resp.url:
                 auth_status.append(resp.status)
         page.on("response", on_auth_response)
+        phase("open_login")
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(1500)
         debug(f"login page url={page.url} title={page.title()} buttons={page.get_by_role('button').all_text_contents()[:5]}")
         # If a persisted session is valid, go directly to Messages.
         if "/auth/login" in page.url:
+            phase("submit_email")
             email_fields = page.locator("input[type=email]")
             if email_fields.count():
                 email_fields.first.fill(EMAIL)
@@ -128,6 +138,7 @@ def _login_and_collect(refresh_attachments=False):
                 debug("login email submitted")
             page.wait_for_timeout(1200)
             try:
+                phase("wait_iris")
                 page.wait_for_url(re.compile(r"identity\.iris\.co\.uk"), timeout=30000)
             except PlaywrightTimeoutError:
                 pass
@@ -149,6 +160,7 @@ def _login_and_collect(refresh_attachments=False):
                 next_button.first.click()
                 debug("IRIS Next clicked")
             try:
+                phase("wait_password")
                 page.locator("input[type=password]").first.wait_for(state="visible", timeout=30000)
             except PlaywrightTimeoutError:
                 raise RuntimeError("password field was not available after the asynchronous login flow")
@@ -156,6 +168,7 @@ def _login_and_collect(refresh_attachments=False):
             if not pw.count():
                 raise RuntimeError("password field was not available after the asynchronous login flow")
             pw.first.fill(PASSWORD)
+            phase("submit_password")
             page.get_by_role("button", name=re.compile("Verify|Sign in|Log in", re.I)).click()
             debug("password submitted")
             page.wait_for_timeout(2500)
@@ -169,6 +182,7 @@ def _login_and_collect(refresh_attachments=False):
                 page.wait_for_url(re.compile(r"pmx\.parentmail\.co\.uk|parents\.parentmail\.co\.uk"), timeout=30000)
             except PlaywrightTimeoutError:
                 pass
+        phase("open_messages")
         page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2500)
         debug(f"messages page url={page.url} title={page.title()}")
@@ -184,6 +198,7 @@ def _login_and_collect(refresh_attachments=False):
                     if isinstance(data,dict) and isinstance(data.get("data"),list): responses.append(data)
                 except Exception: pass
         page.on("response", on_response)
+        phase("capture_conversations")
         page.reload(wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(4000)
         resources = page.evaluate("performance.getEntriesByType('resource').map(x=>x.name)")
@@ -200,6 +215,7 @@ def _login_and_collect(refresh_attachments=False):
         }""")
         if result.get("responses"): responses.extend(result["responses"])
         debug(f"conversation capture responses={len(responses)} browser_fetch_responses={len(result.get('responses', []))} keys={result.get('keys', [])}")
+        phase("collect_attachments")
         # Visit detail pages in the same authenticated browser context to collect
         # attachment links. By default only unknown message IDs are opened; the
         # refresh flag is for a controlled migration/backfill run.
@@ -235,6 +251,7 @@ def _login_and_collect(refresh_attachments=False):
 
 
 def persist(responses, attachments=None, dry_run=False):
+    phase("persist_sqlite")
     attachments = attachments or []
     DB.parent.mkdir(parents=True, exist_ok=True)
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; init_db(c)
@@ -311,18 +328,17 @@ def main():
         responses, attachments=login_and_collect(args.refresh_attachments)
         print(persist(responses,attachments,args.dry_run))
         return 0
-    except PlaywrightTimeoutError as e:
-        if os.environ.get("PARENTMAIL_DEBUG"):
+    except PlaywrightTimeoutError:
+        if DEBUG:
             print("DEBUG PlaywrightTimeoutError")
         else:
-            print("SILENT")
+            print(f"ERROR ParentMail worker failed\nphase: {CURRENT_PHASE}\nreason: Playwright timeout")
         return 2
     except Exception as e:
-        # Do not leak credentials/tokens or noisy recaps.
-        if os.environ.get("PARENTMAIL_DEBUG"):
-            msg=re.sub(r"(?i)(password|token|authorization|bearer|cookie)\\s*[:=]\\s*[^\\s]+", r"\\1=[redacted]", str(e))
+        msg=re.sub(r"(?i)(password|token|authorization|bearer|cookie)\\s*[:=]\\s*[^\\s]+", r"\\1=[redacted]", str(e))
+        if DEBUG:
             print("DEBUG",type(e).__name__,msg[:500])
         else:
-            print("SILENT")
+            print(f"ERROR ParentMail worker failed\nphase: {CURRENT_PHASE}\nreason: {type(e).__name__}: {msg[:500]}")
         return 2
 if __name__=='__main__': raise SystemExit(main())
