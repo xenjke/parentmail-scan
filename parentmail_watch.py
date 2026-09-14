@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse, datetime as dt, hashlib, html, io, json, os, re, shutil, sqlite3, sys, zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import quote, urljoin, urlparse
 from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -268,18 +269,23 @@ def _login_and_collect(refresh_attachments=False):
                     mid=item.get("id") or item.get("uuid")
                     if mid and (refresh_attachments or mid not in known): candidate_ids.append(str(mid))
         for mid in dict.fromkeys(candidate_ids):
-            page.goto("https://parents.parentmail.co.uk/messages/"+mid, wait_until="domcontentloaded", timeout=60000)
+            page.goto("https://parents.parentmail.co.uk/messages/" + quote(mid, safe=""), wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(900)
             for link in page.locator("a[href*='/download/']").all():
                 href=link.get_attribute("href") or ""
                 if not href: continue
-                filename=text(link.inner_text()) or href.rsplit("/",1)[-1]
-                response=browser.request.get(href, timeout=30000)
+                download_url=urljoin(page.url, href)
+                parsed_url=urlparse(download_url)
+                if parsed_url.scheme != "https" or parsed_url.hostname not in {"parents.parentmail.co.uk", "pmx.parentmail.co.uk"}:
+                    debug("skipping attachment URL outside ParentMail origin")
+                    continue
+                filename=text(link.inner_text()) or parsed_url.path.rsplit("/",1)[-1]
+                response=browser.request.get(download_url, timeout=30000)
                 if response.status != 200: continue
                 body=response.body()
                 if not body: continue
                 content_type=(response.headers.get("content-type") or "application/octet-stream").split(";",1)[0].strip()
-                attachments.append({"message_id":mid,"filename":filename,"url":href,"bytes":body,"mime_type":content_type})
+                attachments.append({"message_id":mid,"filename":filename,"url":download_url,"bytes":body,"mime_type":content_type})
         browser.close()
         if not responses:
             raise RuntimeError("authenticated portal returned no conversation API responses")
@@ -326,8 +332,9 @@ def persist(responses, attachments=None, dry_run=False):
             server_id=hash_text(a["url"])
             attachment_id=hash_text(a["message_id"]+"\\n"+a["filename"]+"\\n"+digest)
             old_a=c.execute("select attachment_id from attachments where attachment_id=? or server_attachment_id=?",(attachment_id,server_id)).fetchone()
-            safe=re.sub(r"[^A-Za-z0-9._-]+","_",a["filename"]).strip("._") or "attachment.pdf"
-            local=ATTACHMENTS/(a["message_id"]+"_"+safe)
+            safe_message_id=re.sub(r"[^A-Za-z0-9._-]+", "_", str(a["message_id"])).strip("._") or "message"
+            safe=re.sub(r"[^A-Za-z0-9._-]+","_",a["filename"]).strip("._") or "attachment.bin"
+            local=ATTACHMENTS/(safe_message_id+"_"+safe)
             extracted, method = extract_attachment_text(a["bytes"], a["filename"], a["mime_type"])
             if not dry_run:
                 ATTACHMENTS.mkdir(parents=True,exist_ok=True); local.write_bytes(a["bytes"])
@@ -356,7 +363,7 @@ def persist(responses, attachments=None, dry_run=False):
         row=c.execute("select extracted_text from attachment_text where attachment_id=?", (attachment_id,)).fetchone()
         parts.append(f"ATTACHMENT\nFilename: {a['filename']}\nMessage ID: {a['message_id']}\nMime: {a['mime_type']}\nExtracted text:\n{row[0] if row else ''}")
     c.close()
-    return "\\n\\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def main():
