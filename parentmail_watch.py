@@ -5,7 +5,8 @@ Authentication and API calls stay inside a persistent Playwright browser context
 Only committed SQLite changes are eligible for output.
 """
 from __future__ import annotations
-import argparse, datetime as dt, hashlib, html, io, json, os, re, shutil, sqlite3, sys
+import argparse, datetime as dt, hashlib, html, io, json, os, re, shutil, sqlite3, sys, zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -96,6 +97,32 @@ def extract_message(item: dict[str, Any], school_id: str | None) -> dict[str, An
             "item": item, "school_id": school_id}
 
 
+def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple[str, str]:
+    """Extract searchable text without rejecting non-PDF attachments."""
+    lower_name = filename.lower()
+    mime = (mime_type or "").lower()
+    if mime == "application/pdf" or lower_name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            extracted = "\\n".join((page.extract_text() or "") for page in PdfReader(io.BytesIO(data)).pages).strip()
+            return extracted, "pypdf"
+        except Exception:
+            return "", "unavailable_or_failed"
+    if (mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            or lower_name.endswith(".docx")):
+        try:
+            # DOCX is a ZIP of OOXML. Reading w:t nodes preserves paragraph and
+            # table-cell order and avoids making the cron depend on python-docx.
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                xml_data = archive.read("word/document.xml")
+            root = ET.fromstring(xml_data)
+            words = [node.text or "" for node in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")]
+            return text(" ".join(words)), "docx-ooxml"
+        except Exception:
+            return "", "unavailable_or_failed"
+    return "", "unsupported_format"
+
+
 def login_and_collect(refresh_attachments=False, _recovered=False):
     try:
         return _login_and_collect(refresh_attachments)
@@ -143,41 +170,50 @@ def _login_and_collect(refresh_attachments=False):
             except PlaywrightTimeoutError:
                 pass
             debug(f"after IRIS redirect url={page.url} buttons={page.get_by_role('button').all_text_contents()[:5]}")
-            # The direct portal may remain on "Logging in..." while the
-            # asynchronous OAuth redirect is completing.
-            next_button = page.get_by_role("button", name=re.compile("^Next$", re.I))
-            try:
-                next_button.wait_for(state="visible", timeout=30000)
-            except PlaywrightTimeoutError:
-                if auth_status and auth_status[-1] == 401:
-                    raise RuntimeError("parentmail_login_401")
-                raise RuntimeError(f"IRIS Next step was not available after login; url={page.url}; buttons={page.get_by_role('button').all_text_contents()[:5]}; body={re.sub(r'\\s+', ' ', page.locator('body').inner_text())[:300]}")
-            # IRIS/Okta uses a text input for the second email step.
-            if next_button.count():
-                text_fields = page.locator("input[type=text]")
-                if text_fields.count():
-                    text_fields.first.fill(EMAIL)
-                next_button.first.click()
-                debug("IRIS Next clicked")
-            try:
-                phase("wait_password")
-                page.locator("input[type=password]").first.wait_for(state="visible", timeout=30000)
-            except PlaywrightTimeoutError:
-                raise RuntimeError("password field was not available after the asynchronous login flow")
-            pw = page.locator("input[type=password]")
-            if not pw.count():
-                raise RuntimeError("password field was not available after the asynchronous login flow")
-            pw.first.fill(PASSWORD)
-            phase("submit_password")
-            page.get_by_role("button", name=re.compile("Verify|Sign in|Log in", re.I)).click()
-            debug("password submitted")
-            page.wait_for_timeout(2500)
-            for label in ["Stay signed in", "Keep me signed in"]:
+            # A valid persisted session may land directly on the new portal
+            # Dashboard. In that case there is no second IRIS Next step.
+            already_authenticated = (
+                "parents.parentmail.co.uk" in page.url
+                and page.get_by_role("button", name=re.compile("View Profile", re.I)).count() > 0
+            )
+            if already_authenticated:
+                debug("existing authenticated portal session reached Dashboard")
+            else:
+                # The direct portal may remain on "Logging in..." while the
+                # asynchronous OAuth redirect is completing.
+                next_button = page.get_by_role("button", name=re.compile("^Next$", re.I))
                 try:
-                    page.get_by_role("button", name=label, exact=True).click(timeout=1500); break
-                except Exception: pass
-            debug(f"post-IRIS url={page.url} buttons={page.get_by_role('button').all_text_contents()[:5]}")
-            page.wait_for_timeout(2500)
+                    next_button.wait_for(state="visible", timeout=30000)
+                except PlaywrightTimeoutError:
+                    if auth_status and auth_status[-1] == 401:
+                        raise RuntimeError("parentmail_login_401")
+                    raise RuntimeError(f"IRIS Next step was not available after login; url={page.url}; buttons={page.get_by_role('button').all_text_contents()[:5]}; body={re.sub(r'\\s+', ' ', page.locator('body').inner_text())[:300]}")
+                # IRIS/Okta uses a text input for the second email step.
+                if next_button.count():
+                    text_fields = page.locator("input[type=text]")
+                    if text_fields.count():
+                        text_fields.first.fill(EMAIL)
+                    next_button.first.click()
+                    debug("IRIS Next clicked")
+                try:
+                    phase("wait_password")
+                    page.locator("input[type=password]").first.wait_for(state="visible", timeout=30000)
+                except PlaywrightTimeoutError:
+                    raise RuntimeError("password field was not available after the asynchronous login flow")
+                pw = page.locator("input[type=password]")
+                if not pw.count():
+                    raise RuntimeError("password field was not available after the asynchronous login flow")
+                pw.first.fill(PASSWORD)
+                phase("submit_password")
+                page.get_by_role("button", name=re.compile("Verify|Sign in|Log in", re.I)).click()
+                debug("password submitted")
+                page.wait_for_timeout(2500)
+                for label in ["Stay signed in", "Keep me signed in"]:
+                    try:
+                        page.get_by_role("button", name=label, exact=True).click(timeout=1500); break
+                    except Exception: pass
+                debug(f"post-IRIS url={page.url} buttons={page.get_by_role('button').all_text_contents()[:5]}")
+                page.wait_for_timeout(2500)
             try:
                 page.wait_for_url(re.compile(r"pmx\.parentmail\.co\.uk|parents\.parentmail\.co\.uk"), timeout=30000)
             except PlaywrightTimeoutError:
@@ -241,9 +277,9 @@ def _login_and_collect(refresh_attachments=False):
                 response=browser.request.get(href, timeout=30000)
                 if response.status != 200: continue
                 body=response.body()
-                if not body.startswith(b"%PDF"):
-                    continue
-                attachments.append({"message_id":mid,"filename":filename,"url":href,"bytes":body,"mime_type":"application/pdf"})
+                if not body: continue
+                content_type=(response.headers.get("content-type") or "application/octet-stream").split(";",1)[0].strip()
+                attachments.append({"message_id":mid,"filename":filename,"url":href,"bytes":body,"mime_type":content_type})
         browser.close()
         if not responses:
             raise RuntimeError("authenticated portal returned no conversation API responses")
@@ -292,13 +328,7 @@ def persist(responses, attachments=None, dry_run=False):
             old_a=c.execute("select attachment_id from attachments where attachment_id=? or server_attachment_id=?",(attachment_id,server_id)).fetchone()
             safe=re.sub(r"[^A-Za-z0-9._-]+","_",a["filename"]).strip("._") or "attachment.pdf"
             local=ATTACHMENTS/(a["message_id"]+"_"+safe)
-            extracted=""; method="none"
-            try:
-                from pypdf import PdfReader
-                extracted="\\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(a["bytes"])).pages).strip()
-                method="pypdf"
-            except Exception:
-                method="unavailable_or_failed"
+            extracted, method = extract_attachment_text(a["bytes"], a["filename"], a["mime_type"])
             if not dry_run:
                 ATTACHMENTS.mkdir(parents=True,exist_ok=True); local.write_bytes(a["bytes"])
             c.execute("""insert into attachments(attachment_id,message_fingerprint,filename,local_path,content_hash,extracted_text,first_seen_at,last_seen_at,server_attachment_id,message_id,mime_type,extraction_method)
@@ -314,12 +344,19 @@ def persist(responses, attachments=None, dry_run=False):
             c.rollback()
     except Exception:
         c.rollback(); raise
+    if baseline:
+        c.close()
+        return "SILENT"
+    if not new and not new_attachments:
+        c.close()
+        return "SILENT"
+    parts=[f"MESSAGE\nSubject: {m['subject']}\nSender: {m['sender']}\nPublished: {m['published'] or 'date unavailable'}\nBody:\n{m['body']}" for m in new]
+    for a in new_attachments:
+        attachment_id=hash_text(a["message_id"]+"\\n"+a["filename"]+"\\n"+hashlib.sha256(a["bytes"]).hexdigest())
+        row=c.execute("select extracted_text from attachment_text where attachment_id=?", (attachment_id,)).fetchone()
+        parts.append(f"ATTACHMENT\nFilename: {a['filename']}\nMessage ID: {a['message_id']}\nMime: {a['mime_type']}\nExtracted text:\n{row[0] if row else ''}")
     c.close()
-    if baseline: return "SILENT"
-    if not new and not new_attachments: return "SILENT"
-    parts=[f"{m['subject']}\n{m['sender']}\n{m['published'] or 'date unavailable'}\n{m['body'][:500]}" for m in new]
-    parts.extend(f"Attachment added: {a['filename']} (message {a['message_id']})" for a in new_attachments)
-    return "\n\n".join(parts)
+    return "\\n\\n".join(parts)
 
 
 def main():
