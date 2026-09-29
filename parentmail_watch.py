@@ -5,7 +5,7 @@ Authentication and API calls stay inside a persistent Playwright browser context
 Only committed SQLite changes are eligible for output.
 """
 from __future__ import annotations
-import argparse, datetime as dt, hashlib, html, io, json, os, re, shutil, sqlite3, sys, zipfile
+import argparse, csv, datetime as dt, hashlib, html, io, json, os, posixpath, re, shutil, sqlite3, subprocess, sys, tempfile, zipfile, zlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
@@ -98,6 +98,26 @@ def extract_message(item: dict[str, Any], school_id: str | None) -> dict[str, An
             "item": item, "school_id": school_id}
 
 
+def visible_docx_nodes(node: ET.Element):
+    """Walk one OOXML AlternateContent branch rather than Choice and Fallback."""
+    mc = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+    image_tags = {"{http://schemas.openxmlformats.org/drawingml/2006/main}blip",
+                  "{urn:schemas-microsoft-com:vml}imagedata"}
+    if node.tag == mc + "AlternateContent":
+        choice = next((child for child in node if child.tag == mc + "Choice"
+                       and any(descendant.tag in image_tags for descendant in child.iter())), None)
+        if choice is None:
+            choice = next((child for child in node if child.tag == mc + "Choice"), None)
+        if choice is None:
+            choice = next((child for child in node if child.tag == mc + "Fallback"), None)
+        if choice is not None:
+            yield from visible_docx_nodes(choice)
+        return
+    yield node
+    for child in node:
+        yield from visible_docx_nodes(child)
+
+
 def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple[str, str]:
     """Extract searchable text without rejecting non-PDF attachments."""
     lower_name = filename.lower()
@@ -112,16 +132,153 @@ def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple
     if (mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             or lower_name.endswith(".docx")):
         try:
-            # DOCX is a ZIP of OOXML. Reading w:t nodes preserves paragraph and
-            # table-cell order and avoids making the cron depend on python-docx.
+            # DOCX tables can be screenshots rather than w:tbl elements. OCR only
+            # images referenced in the document, in the surrounding text order.
+            w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+            a = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+            r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+            v = "{urn:schemas-microsoft-com:vml}"
+            o = "{urn:schemas-microsoft-com:office:office}"
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                xml_data = archive.read("word/document.xml")
-            root = ET.fromstring(xml_data)
-            words = [node.text or "" for node in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")]
-            return text(" ".join(words)), "docx-ooxml"
+                document_member = archive.getinfo("word/document.xml")
+                if document_member.file_size > 4_000_000:
+                    raise ValueError("DOCX document XML is too large")
+                xml_data = archive.read(document_member)
+                root = ET.fromstring(xml_data)
+                drawings = list(root.iter(a + "blip")) + list(root.iter(v + "imagedata"))
+                relationships = {}
+                if drawings:
+                    try:
+                        rel_member = archive.getinfo("word/_rels/document.xml.rels")
+                        if rel_member.file_size > 1_000_000:
+                            raise ValueError("DOCX relationships XML is too large")
+                        rels = ET.fromstring(archive.read(rel_member))
+                    except (KeyError, ValueError, zipfile.BadZipFile, ET.ParseError, zlib.error):
+                        rels = ()
+                    relationships = {
+                        item.get("Id"): item.get("Target")
+                        for item in rels
+                        if (item.get("Type", "").endswith("/image")
+                            and item.get("TargetMode", "Internal").lower() == "internal")
+                    }
+                parts = []
+                incomplete = False
+                image_count = 0
+                words = []
+                for node in visible_docx_nodes(root):
+                    if node.tag == w + "p":
+                        if words:
+                            parts.append(text(" ".join(words)))
+                            words = []
+                    elif node.tag == w + "t":
+                        words.append(node.text or "")
+                    elif node.tag in (a + "blip", v + "imagedata"):
+                        relationship_id = (node.get(r + "embed") or node.get(r + "id")
+                                           or node.get(o + "relid"))
+                        if words:
+                            parts.append(text(" ".join(words)))
+                            words = []
+                        image_count += 1
+                        target = relationships.get(relationship_id)
+                        path = posixpath.normpath(
+                            target.lstrip("/") if target and target.startswith("/word/")
+                            else posixpath.join("word", target or "")
+                        )
+                        ocr_text, ocr_complete = "", False
+                        if image_count <= 8 and target and path.startswith("word/media/"):
+                            try:
+                                member = archive.getinfo(path)
+                            except KeyError:
+                                pass
+                            else:
+                                if member.file_size <= 8_000_000:
+                                    try:
+                                        image_data = archive.read(member)
+                                    except Exception:
+                                        # A corrupt image member must not erase text already read.
+                                        pass
+                                    else:
+                                        ocr_text, ocr_complete = ocr_docx_image(image_data)
+                        if ocr_text:
+                            parts.append(f"[Embedded image {image_count} OCR]\n{ocr_text}\n[/Embedded image {image_count} OCR]")
+                            if not ocr_complete:
+                                incomplete = True
+                                parts.append(f"[Embedded image {image_count}: OCR text truncated; check original attachment]")
+                        else:
+                            incomplete = True
+                            parts.append(f"[Embedded image {image_count}: OCR unavailable or unreadable; check original attachment]")
+                if words:
+                    parts.append(text(" ".join(words)))
+            method = "docx-ooxml+ocr-incomplete" if incomplete else "docx-ooxml+ocr" if image_count else "docx-ooxml"
+            return "\n".join(part for part in parts if part), method
         except Exception:
             return "", "unavailable_or_failed"
     return "", "unsupported_format"
+
+
+def ocr_docx_image(data: bytes) -> tuple[str, bool]:
+    """OCR an embedded screenshot, returning (text, complete)."""
+    if not shutil.which("tesseract"):
+        return "", False
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as image:
+            if image.width * image.height > 12_000_000:
+                return "", False
+            rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, "white")
+        background.alpha_composite(rgba)
+        image_bytes = io.BytesIO()
+        background.convert("RGB").save(image_bytes, format="PNG")
+        with tempfile.TemporaryFile(dir=os.environ.get("TMPDIR")) as output:
+            result = subprocess.run(
+                ["tesseract", "stdin", "stdout", "--psm", "11", "-l", "eng", "tsv"],
+                input=image_bytes.getvalue(), stdout=output, stderr=subprocess.DEVNULL,
+                timeout=15, check=False,
+            )
+            if result.returncode or output.tell() > 2_000_000:
+                return "", False
+            output.seek(0)
+            tsv = output.read().decode("utf-8", errors="replace")
+        # PSM 11 reads faint/highlighted table rows missed by PSM 3, but its
+        # plain-text output can scramble cell order. Rebuild rows from boxes.
+        boxes = []
+        for box in csv.DictReader(io.StringIO(tsv), delimiter="\t"):
+            word = text(box.get("text"))
+            if word:
+                if len(boxes) >= 4_000:
+                    return "", False
+                boxes.append((int(box["left"]), int(box["top"]), int(box["width"]), int(box["height"]), word))
+        if not boxes:
+            return "", False
+        heights = sorted(box[3] for box in boxes)
+        median_height = heights[len(heights) // 2]
+        line_tolerance = max(8, median_height // 2)
+        column_gap = max(40, median_height * 3 // 2)
+        rows = []
+        for box in sorted(boxes, key=lambda item: (item[1] + item[3] / 2, item[0])):
+            center = box[1] + box[3] / 2
+            if not rows or abs(center - rows[-1][0]) > line_tolerance:
+                rows.append((center, [box]))
+            else:
+                rows[-1][1].append(box)
+        lines = []
+        for _, row in rows:
+            tokens = []
+            previous_end = None
+            for left, _, width, _, word in sorted(row):
+                if previous_end is not None and left - previous_end > column_gap:
+                    tokens.append("|")
+                tokens.append(word)
+                previous_end = left + width
+            lines.append(" ".join(tokens))
+        extracted = "\n".join(lines)
+        return extracted[:10_000], len(extracted) <= 10_000
+    except Exception:
+        # Untrusted embedded pixels or a missing OCR dependency must not erase
+        # the rest of the document; caller marks this image as incomplete.
+        return "", False
 
 
 def login_and_collect(refresh_attachments=False, _recovered=False):

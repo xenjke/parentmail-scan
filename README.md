@@ -15,15 +15,26 @@ Deterministic, read-only IRIS ParentMail monitor for Home Assistant/Hermes cron.
 - Python 3.11+
 - Playwright Python package and a Chromium executable
 - `pypdf` for PDF extraction
+- Pillow and Tesseract with English language data for text embedded as images in DOCX
 
 Example:
 
 ```bash
-python -m pip install playwright pypdf
+python -m pip install playwright pypdf pillow
 playwright install chromium
+# Install Tesseract separately: Arch `sudo pacman -S tesseract tesseract-data-eng`
+# or macOS `brew install tesseract`.
 ```
 
 The production Hermes environment already provides Playwright and Chromium through its runtime.
+It currently also has Pillow and `tesseract`/English data. Check after a runtime upgrade:
+`python -c 'from PIL import Image; print(Image.__version__)'` and `tesseract --list-langs`.
+
+DOCX extraction preserves paragraph/table-cell text and OCRs embedded screenshot
+tables in document order. Transparent images are composited onto white before OCR.
+If an embedded image is unreadable, too large, or the OCR dependencies are missing,
+the text includes an explicit incomplete-OCR marker instead of claiming no dates exist.
+Images are limited in count/size and OCR has a per-image timeout.
 
 Install local dependencies with:
 
@@ -125,12 +136,19 @@ Successful no-change output is exactly `SILENT`. A non-zero exit means the run m
 
 ## Cron
 
-Use the script as a script-only job, not an LLM-driven browser job:
+The deployed hourly job uses this deterministic script as a **pre-run collector**;
+its LLM only summarizes committed new items and cannot browse ParentMail:
 
-- script: `parentmail_watch.py`
-- no_agent: `true`
+- script: `/opt/data/scripts/parentmail_watch_cron.sh` (executes this checkout's `parentmail_watch.py`)
+- no_agent: `false` (summarization only)
 - schedule: hourly
 - delivery: the intended private channel
+
+Run extraction regression tests with `PYTHONPATH=. python -m unittest discover -s tests -v`.
+To also probe a private, locally stored Forest School DOCX without committing it,
+set `PARENTMAIL_TEST_DOCX=/path/to/letter.docx` before that command.
+Re-extracting an existing attachment should update its saved text without making
+the already-persisted attachment eligible for another notification.
 
 ## State
 
