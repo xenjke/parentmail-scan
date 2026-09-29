@@ -49,7 +49,7 @@ shell: env
 
 install: env
 	@set -euo pipefail; \
-	"$(PYTHON)" -m pip install playwright pypdf; \
+	"$(PYTHON)" -m pip install playwright pypdf pillow; \
 	"$(PYTHON)" -m playwright install chromium
 
 run: env
