@@ -295,6 +295,31 @@ class SwayPipelineTests(unittest.TestCase):
         self.assertEqual(collect_sway_links([response], FakeContext(page), cached_links=cached), [])
         self.assertEqual(len(collect_sway_links([response], FakeContext(page), cached_links=cached, force=True)), 1)
 
+    def _responses(self, *pairs):
+        return [{"data": [{"id": mid, "title": f"Message {mid}",
+                           "last_message": {"id": mid, "content": f"Read {url}"}} for mid, url in pairs]}]
+
+    def test_new_message_links_are_fetched_before_older_failures_and_unfetched_ones_reported(self):
+        urls = [f"https://sway.cloud.microsoft/Sway{i}Document0000" for i in range(6)]
+        old = [(f"old-{i}", urls[i]) for i in range(3)]
+        new = [(f"new-{i}", urls[3 + i]) for i in range(3)]
+        responses = self._responses(*old, *new, ("new-3", "https://sway.cloud.microsoft/SwayExtraDocument00"))
+        page = FakePage("Page", "Accessibility View " + ("newsletter " * 30))
+        links = collect_sway_links(responses, FakeContext(page), known_message_ids={m for m, _ in old})
+        fetched = [l["message_id"] for l in links if l["extraction_method"] != parentmail_watch.SWAY_NOT_ATTEMPTED]
+        skipped = [l["message_id"] for l in links if l["extraction_method"] == parentmail_watch.SWAY_NOT_ATTEMPTED]
+        self.assertEqual(fetched, ["new-0", "new-1", "new-2"])
+        self.assertEqual(skipped, ["new-3"])
+
+    def test_recent_failures_on_known_messages_are_not_retried(self):
+        url = "https://sway.cloud.microsoft/AbCdEf1234567890"
+        responses = self._responses(("old", url))
+        page = FakePage("Page", "Accessibility View " + ("newsletter " * 30))
+        self.assertEqual(collect_sway_links(responses, FakeContext(page), known_message_ids={"old"},
+                                            recently_failed={("old", url)}), [])
+        self.assertEqual(len(collect_sway_links(responses, FakeContext(page), known_message_ids={"old"},
+                                                recently_failed={("old", url)}, force=True)), 1)
+
     def test_link_content_is_persisted_and_attached_to_new_message_summary_only_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_db, old_attachments = parentmail_watch.DB, parentmail_watch.ATTACHMENTS
@@ -339,6 +364,13 @@ class SwayPipelineTests(unittest.TestCase):
                 saved_text = conn.execute("select extracted_text from message_links where message_id=?", ("message-1",)).fetchone()[0]
                 conn.close()
                 self.assertEqual(saved_text, "Updated newsletter text.")
+
+                failed = dict(link, title="", extracted_text="", extraction_method="sway_timeout")
+                self.assertEqual(parentmail_watch.persist([response], linked_content=[failed]), "SILENT")
+                conn = sqlite3.connect(parentmail_watch.DB)
+                kept = conn.execute("select title,extracted_text,extraction_method from message_links where message_id=?", ("message-1",)).fetchone()
+                conn.close()
+                self.assertEqual(kept, ("The Anchor", "Updated newsletter text.", "sway-playwright"))
             finally:
                 parentmail_watch.DB, parentmail_watch.ATTACHMENTS = old_db, old_attachments
 
