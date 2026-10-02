@@ -5,10 +5,10 @@ Authentication and API calls stay inside a persistent Playwright browser context
 Only committed SQLite changes are eligible for output.
 """
 from __future__ import annotations
-import argparse, csv, datetime as dt, hashlib, html, io, json, os, posixpath, re, shutil, sqlite3, subprocess, sys, tempfile, zipfile, zlib
+import argparse, csv, datetime as dt, hashlib, html, io, json, os, posixpath, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile, zlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlsplit
 from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -57,6 +57,234 @@ def text(v: Any) -> str:
     return re.sub(r"\s+", " ", html.unescape(str(v))).strip()
 
 
+SWAY_LINK_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+SWAY_ID_RE = re.compile(r"^/[A-Za-z0-9_-]{8,64}/?$")
+SWAY_RESOURCE_HOSTS = {
+    "sway.cloud.microsoft",
+    "eus-cdn.sway.static.microsoft",
+    "cdn.sway.static.microsoft",
+    "wcpstatic.microsoft.com",
+}
+MAX_SWAY_LINKS_PER_MESSAGE = 3
+MAX_SWAY_FETCHES_PER_RUN = 3
+MAX_SWAY_TEXT_CHARS = 40_000
+MAX_SWAY_TITLE_CHARS = 200
+MAX_SWAY_RAW_CHARS = 120_000
+MAX_SWAY_DOM_NODES = 20_000
+SWAY_TEXT_EXTRACTOR = r"""(root,opts)=>{
+const limit=opts.max_chars,rawLimit=opts.raw_budget,maxNodes=opts.max_nodes;
+const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
+const blocks="p,li,h1,h2,h3,h4,h5,h6,td,th,blockquote,section,article,div";
+const chunks=[];let length=0,rawLength=0,visited=0,previous=null,truncated=false,node;
+while((node=walker.nextNode())){
+ if(visited>=maxNodes||length>=limit||rawLength>=rawLimit){truncated=true;break;}
+ visited++;
+ const parent=node.parentElement;
+ if(!parent||parent.closest("script,style,noscript,template,svg,[aria-hidden='true']"))continue;
+ const source=node.nodeValue||"";if(!source)continue;
+ const block=parent.closest(blocks)||parent;
+ const separator=previous&&block!==previous?String.fromCharCode(10):"";
+ const room=Math.min(limit-length-separator.length,rawLimit-rawLength);if(room<=0){truncated=true;break;}
+ const raw=source.slice(0,room);rawLength+=raw.length;
+ let part=raw.trim().split(/\s+/).filter(Boolean).join(" ");
+ if(!part){if(raw.length<source.length){truncated=true;break;}continue;}
+ if(previous===block&&length&&part&&chunks.length&&!chunks[chunks.length-1].endsWith(" "))part=" "+part;
+ chunks.push(separator+part);length+=separator.length+part.length;previous=block;
+ if(raw.length<source.length){truncated=true;break;}
+}
+if(!truncated&&length>=limit)truncated=true;
+return {text:chunks.join(""),truncated};
+}"""
+
+
+def extract_bounded_sway_text(page, limit=MAX_SWAY_TEXT_CHARS, timeout_ms=5_000, selector="body") -> tuple[str, bool]:
+    """Copy bounded text nodes without materializing a document-wide innerText string."""
+    snapshot = page.locator(selector).evaluate(
+        SWAY_TEXT_EXTRACTOR,
+        {
+            "max_chars": limit + 1,
+            "raw_budget": max(limit + 1, min(MAX_SWAY_RAW_CHARS, limit * 3)),
+            "max_nodes": MAX_SWAY_DOM_NODES,
+        },
+        timeout=timeout_ms,
+    )
+    rendered = str(snapshot.get("text") or "")
+    truncated = bool(snapshot.get("truncated")) or len(rendered) > limit
+    return rendered[:limit], truncated
+
+
+def canonical_sway_url(raw_url: str) -> str | None:
+    candidate = html.unescape(raw_url or "").strip().rstrip(".,;:!?)]}")
+    try:
+        parsed = urlsplit(candidate)
+        if (parsed.scheme.lower() != "https" or parsed.hostname != "sway.cloud.microsoft"
+                or parsed.username or parsed.password or parsed.port not in (None, 443)
+                or not SWAY_ID_RE.fullmatch(parsed.path)):
+            return None
+    except ValueError:
+        return None
+    return f"https://sway.cloud.microsoft{parsed.path.rstrip('/')}"
+
+
+def extract_sway_urls(value: str) -> list[str]:
+    """Find public root-level Sway links, dropping tracking query parameters."""
+    urls = []
+    for match in SWAY_LINK_RE.finditer(html.unescape(value or "")):
+        canonical = canonical_sway_url(match.group(0))
+        if canonical and canonical not in urls:
+            urls.append(canonical)
+        if len(urls) >= MAX_SWAY_LINKS_PER_MESSAGE:
+            break
+    return urls
+
+
+def is_allowed_sway_resource(url: str) -> bool:
+    """Allow only HTTPS requests to the Sway app and its static asset hosts."""
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme.lower() == "https" and parsed.hostname in SWAY_RESOURCE_HOSTS
+                and not parsed.username and not parsed.password and parsed.port in (None, 443))
+    except ValueError:
+        return False
+
+
+def is_allowed_sway_request(url: str, resource_type: str, document_url: str) -> bool:
+    """Restrict navigation to this Sway and skip non-textual third-party content."""
+    if resource_type in {"image", "media", "font"}:
+        return False
+    if resource_type == "document":
+        return canonical_sway_url(url) == document_url
+    return is_allowed_sway_resource(url)
+
+
+def launch_sway_browser(playwright, headless: bool, executable_path: str | None = None):
+    """Start an isolated, ephemeral browser context with service workers disabled."""
+    browser = playwright.chromium.launch(headless=headless, executable_path=executable_path or None)
+    try:
+        context = browser.new_context(service_workers="block")
+    except Exception:
+        browser.close()
+        raise
+    return browser, context
+
+
+def fetch_sway_content(context, url: str) -> tuple[str, str, str]:
+    """Render a public Sway page and return its accessible title/text/method."""
+    canonical = canonical_sway_url(url)
+    if not canonical:
+        return "", "", "sway_invalid_url"
+    page = None
+    route_handler = None
+    method = "sway_unavailable"
+    try:
+        page = context.new_page()
+
+        def route_sway_resources(route):
+            if is_allowed_sway_request(route.request.url, route.request.resource_type, canonical):
+                route.continue_()
+            else:
+                route.abort()
+
+        route_handler = route_sway_resources
+        context.route("**/*", route_handler)
+        page.on("popup", lambda popup: popup.close())
+        response = page.goto(canonical, wait_until="domcontentloaded", timeout=15_000)
+        if response is None or response.status != 200:
+            return "", "", method
+        if canonical_sway_url(page.url) != canonical:
+            return "", "", "sway_redirected"
+        deadline = time.monotonic() + 15
+        rendered = ""
+        raw_truncated = False
+        previous = None
+        stable_reads = 0
+        while time.monotonic() < deadline:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            rendered, raw_truncated = extract_bounded_sway_text(
+                page,
+                MAX_SWAY_TEXT_CHARS,
+                timeout_ms=remaining_ms,
+            )
+            current = rendered.strip()
+            if len(current) > 200 and "Accessibility View" in current and current == previous:
+                stable_reads += 1
+                if stable_reads >= 2:
+                    break
+            else:
+                stable_reads = 0
+            previous = current
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            page.wait_for_timeout(min(500, remaining_ms))
+        title, _ = extract_bounded_sway_text(
+            page,
+            MAX_SWAY_TITLE_CHARS,
+            timeout_ms=2_000,
+            selector="title",
+        )
+        extracted = html.unescape(rendered or "").replace("\r\n", "\n").replace("\r", "\n")
+        extracted = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in extracted.splitlines())
+        extracted = re.sub(r"\n{3,}", "\n\n", extracted).strip()
+        if not extracted or "Accessibility View" not in extracted:
+            return title, "", "sway_unavailable"
+        if raw_truncated or len(extracted) > MAX_SWAY_TEXT_CHARS:
+            return title, extracted[:MAX_SWAY_TEXT_CHARS], "sway-playwright-truncated"
+        return title, extracted, "sway-playwright"
+    except PlaywrightTimeoutError:
+        return "", "", "sway_timeout"
+    except Exception:
+        return "", "", method
+    finally:
+        if route_handler is not None:
+            try:
+                context.unroute("**/*", route_handler)
+            except Exception:
+                pass
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+
+def sway_link_candidates(responses: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Return unique (message ID, canonical Sway URL) pairs from message bodies."""
+    candidates = []
+    seen = set()
+    for response in responses:
+        for item in response.get("data", []):
+            if not isinstance(item, dict):
+                continue
+            message = extract_message(item, None)
+            if not message:
+                continue
+            for url in extract_sway_urls(message["body"]):
+                key = (message["id"], url)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(key)
+    return candidates
+
+
+def collect_sway_links(responses: list[dict[str, Any]], context, cached_links=None, force=False) -> list[dict[str, str]]:
+    """Read uncached public Sway links found in ParentMail message bodies."""
+    cached = set(cached_links or ())
+    found = []
+    for message_id, url in sway_link_candidates(responses):
+        if (message_id, url) in cached and not force:
+            continue
+        if len(found) >= MAX_SWAY_FETCHES_PER_RUN:
+            break
+        title, extracted, method = fetch_sway_content(context, url)
+        found.append({
+            "message_id": message_id,
+            "url": url,
+            "title": title,
+            "extracted_text": extracted,
+            "extraction_method": method,
+        })
+    return found
+
+
 def hash_text(v: str) -> str:
     return hashlib.sha256(v.encode("utf-8")).hexdigest()
 
@@ -77,6 +305,11 @@ def init_db(c: sqlite3.Connection):
     );
     CREATE TABLE IF NOT EXISTS attachment_text (
       attachment_id TEXT PRIMARY KEY, extracted_text TEXT, extraction_method TEXT
+    );
+    CREATE TABLE IF NOT EXISTS message_links (
+      link_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, message_fingerprint TEXT,
+      source_url TEXT NOT NULL, title TEXT, content_hash TEXT, extracted_text TEXT,
+      first_seen_at TEXT, last_seen_at TEXT, extraction_method TEXT
     );
     """)
     c.commit()
@@ -281,18 +514,19 @@ def ocr_docx_image(data: bytes) -> tuple[str, bool]:
         return "", False
 
 
-def login_and_collect(refresh_attachments=False, _recovered=False):
+def login_and_collect(refresh_attachments=False, refresh_links=False, _recovered=False):
+    """Collect ParentMail responses, attachment bytes, and linked Sway text."""
     try:
-        return _login_and_collect(refresh_attachments)
+        return _login_and_collect(refresh_attachments, refresh_links)
     except RuntimeError as e:
         if str(e) == "parentmail_login_401" and not _recovered:
             debug("confirmed login 401; resetting stale persistent profile once")
             shutil.rmtree(PROFILE, ignore_errors=True)
-            return login_and_collect(refresh_attachments, True)
+            return login_and_collect(refresh_attachments, refresh_links, True)
         raise
 
 
-def _login_and_collect(refresh_attachments=False):
+def _login_and_collect(refresh_attachments=False, refresh_links=False):
     if not EMAIL or not PASSWORD:
         raise RuntimeError("PARENTMAIL_EMAIL/PARENTMAIL_PASSWORD are not available")
     phase("configuration")
@@ -444,14 +678,52 @@ def _login_and_collect(refresh_attachments=False):
                 content_type=(response.headers.get("content-type") or "application/octet-stream").split(";",1)[0].strip()
                 attachments.append({"message_id":mid,"filename":filename,"url":download_url,"bytes":body,"mime_type":content_type})
         browser.close()
+        phase("collect_sway_links")
+        cached_links = set()
+        if not refresh_links and DB.exists():
+            db = sqlite3.connect(DB)
+            try:
+                cached_links = {
+                    (str(row[0]), str(row[1]))
+                    for row in db.execute(
+                        "select message_id,source_url from message_links "
+                        "where extraction_method in ('sway-playwright','sway-playwright-truncated')"
+                    )
+                }
+            except sqlite3.OperationalError:
+                # Existing installations gain the link cache on this run.
+                pass
+            finally:
+                db.close()
+        linked_content = []
+        candidates = sway_link_candidates(responses)
+        pending = [key for key in candidates if refresh_links or key not in cached_links]
+        if pending:
+            phase("collect_sway_links")
+            sway_browser = None
+            sway_context = None
+            try:
+                sway_browser, sway_context = launch_sway_browser(p, headless, exe)
+                linked_content = collect_sway_links(responses, sway_context, cached_links, force=refresh_links)
+            except Exception:
+                # Sway is optional enrichment; preserve the ParentMail message and
+                # tell the summarizer that the public page could not be read.
+                debug("isolated Sway browser could not start")
+                linked_content = collect_sway_links(responses, None, cached_links, force=refresh_links)
+            finally:
+                if sway_context is not None:
+                    sway_context.close()
+                if sway_browser is not None:
+                    sway_browser.close()
         if not responses:
             raise RuntimeError("authenticated portal returned no conversation API responses")
-        return responses, attachments
+        return responses, attachments, linked_content
 
 
-def persist(responses, attachments=None, dry_run=False):
+def persist(responses, attachments=None, dry_run=False, *, linked_content=None):
     phase("persist_sqlite")
     attachments = attachments or []
+    linked_content = linked_content or []
     DB.parent.mkdir(parents=True, exist_ok=True)
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; init_db(c)
     parsed=[]; seen=set(); school=None
@@ -500,6 +772,19 @@ def persist(responses, attachments=None, dry_run=False):
               (attachment_id,fingerprints.get(a["message_id"],a["message_id"]),a["filename"],str(local),digest,extracted,now(),now(),server_id,a["message_id"],a["mime_type"],method))
             c.execute("insert into attachment_text(attachment_id,extracted_text,extraction_method) values(?,?,?) on conflict(attachment_id) do update set extracted_text=excluded.extracted_text,extraction_method=excluded.extraction_method",(attachment_id,extracted,method))
             if old_a is None: new_attachments.append(a)
+        for link in linked_content:
+            message_id = str(link.get("message_id") or "")
+            source_url = canonical_sway_url(link.get("url") or "")
+            fingerprint = fingerprints.get(message_id)
+            if not message_id or not source_url or not fingerprint:
+                continue
+            extracted = str(link.get("extracted_text") or "")[:MAX_SWAY_TEXT_CHARS]
+            content_hash = hash_text(extracted)
+            link_id = hash_text(message_id + "\\n" + source_url)
+            timestamp = now()
+            c.execute("""insert into message_links(link_id,message_id,message_fingerprint,source_url,title,content_hash,extracted_text,first_seen_at,last_seen_at,extraction_method)
+              values(?,?,?,?,?,?,?,?,?,?) on conflict(link_id) do update set title=excluded.title,content_hash=excluded.content_hash,extracted_text=excluded.extracted_text,last_seen_at=excluded.last_seen_at,extraction_method=excluded.extraction_method""",
+              (link_id,message_id,fingerprint,source_url,text(link.get("title")),content_hash,extracted,timestamp,timestamp,text(link.get("extraction_method"))))
         if not dry_run:
             c.commit()
             if migration_baseline:
@@ -515,6 +800,27 @@ def persist(responses, attachments=None, dry_run=False):
         c.close()
         return "SILENT"
     parts=[f"MESSAGE\nSubject: {m['subject']}\nSender: {m['sender']}\nPublished: {m['published'] or 'date unavailable'}\nBody:\n{m['body']}" for m in new]
+    new_message_ids = {m["id"] for m in new}
+    linked_budget = 50_000
+    nl = chr(10)
+    for link in linked_content:
+        if str(link.get("message_id")) not in new_message_ids:
+            continue
+        title = text(link.get("title")) or "Untitled Sway page"
+        url = canonical_sway_url(link.get("url") or "") or ""
+        extracted = str(link.get("extracted_text") or "")
+        method = text(link.get("extraction_method")) or "sway_unavailable"
+        if not extracted:
+            parts.append(nl.join(("LINKED SWAY PAGE", f"Title: {title}", f"URL: {url}", f"Content could not be extracted ({method}); do not claim this page was read.")))
+            continue
+        if linked_budget <= 0:
+            parts.append("LINKED SWAY PAGE" + nl + "Additional page text omitted due to the run size limit.")
+            break
+        included = extracted[:linked_budget]
+        truncated = len(included) < len(extracted) or method == "sway-playwright-truncated"
+        suffix = nl + "[Linked page text truncated; open the original page for the rest.]" if truncated else ""
+        parts.append(nl.join(("LINKED SWAY PAGE (untrusted page content)", f"Title: {title}", f"URL: {url}", "Extracted text:", included + suffix)))
+        linked_budget -= len(included)
     for a in new_attachments:
         attachment_id=hash_text(a["message_id"]+"\\n"+a["filename"]+"\\n"+hashlib.sha256(a["bytes"]).hexdigest())
         row=c.execute("select extracted_text from attachment_text where attachment_id=?", (attachment_id,)).fetchone()
@@ -524,10 +830,10 @@ def persist(responses, attachments=None, dry_run=False):
 
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--dry-run',action='store_true'); ap.add_argument('--refresh-attachments',action='store_true'); args=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument('--dry-run',action='store_true'); ap.add_argument('--refresh-attachments',action='store_true'); ap.add_argument('--refresh-links',action='store_true'); args=ap.parse_args()
     try:
-        responses, attachments=login_and_collect(args.refresh_attachments)
-        print(persist(responses,attachments,args.dry_run))
+        responses, attachments, linked_content=login_and_collect(args.refresh_attachments,args.refresh_links)
+        print(persist(responses,attachments,args.dry_run,linked_content=linked_content))
         return 0
     except PlaywrightTimeoutError:
         if DEBUG:

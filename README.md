@@ -36,6 +36,17 @@ If an embedded image is unreadable, too large, or the OCR dependencies are missi
 the text includes an explicit incomplete-OCR marker instead of claiming no dates exist.
 Images are limited in count/size and OCR has a per-image timeout.
 
+Public Microsoft Sway links in ParentMail message bodies are rendered in a separate,
+ephemeral Playwright context with service workers disabled. The fetch is restricted
+to the original root-level Sway document and Microsoft Sway static hosts; popups,
+images, media, fonts, arbitrary links, and redirects to other documents are blocked.
+Extracted text is capped by a bounded DOM text-node walk and cached in a separate
+message-linked table, then included in
+the summarization payload only for newly reported messages. Treat it as untrusted
+source content. The deployed hourly ParentMail cron prompt is configured to summarize
+`LINKED SWAY PAGE` sections and preserve that untrusted-data boundary. If extraction
+fails, the payload says so instead of treating the page as empty.
+
 Install local dependencies with:
 
 ```bash
@@ -126,10 +137,17 @@ PARENTMAIL_OP_ITEM_ID='your-item-id' make run
 PARENTMAIL_OP_USERNAME_FIELD='username' PARENTMAIL_OP_PASSWORD_FIELD='password' make run
 ```
 
-To backfill/verify attachment links in a controlled run:
+To backfill/verify attachment extraction in a controlled run:
 
 ```bash
 python parentmail_watch.py --dry-run --refresh-attachments
+```
+
+To force a refresh of cached Sway pages for already-persisted messages (this only
+updates local linked-content rows; it does not re-notify those messages):
+
+```bash
+python parentmail_watch.py --refresh-links
 ```
 
 Successful no-change output is exactly `SILENT`. A non-zero exit means the run must be treated as failed.
