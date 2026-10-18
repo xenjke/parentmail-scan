@@ -162,6 +162,10 @@ its LLM only summarizes committed new items and cannot browse ParentMail:
 - schedule: hourly
 - delivery: the intended private channel
 
+### Production wrapper and deployment ownership
+
+The host cron entry is `/opt/data/scripts/parentmail_watch_cron.sh`; it runs `/opt/data/workspace/parentmail-scan/parentmail_watch.py` directly. `parentmail-scan` is not an approved `sudo hermes-ctl deploy` target. Merging a PR does not update the production checkout; production updates must use the operator's approved host path. Do not claim deployment from a repo merge alone.
+
 Run extraction regression tests with `PYTHONPATH=. python -m unittest discover -s tests -v`.
 To also probe a private, locally stored Forest School DOCX without committing it,
 set `PARENTMAIL_TEST_DOCX=/path/to/letter.docx` before that command.
