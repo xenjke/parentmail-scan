@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse, csv, datetime as dt, hashlib, html, io, json, os, posixpath, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile, zlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
+from urllib.parse import quote, urljoin, urlparse, urlsplit
 from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -116,30 +116,11 @@ def extract_bounded_sway_text(page, limit=MAX_SWAY_TEXT_CHARS, timeout_ms=5_000,
     return rendered[:limit], truncated
 
 
-# Sway documents are shared under both hosts with the same document IDs.
-SWAY_HOSTS = {"sway.cloud.microsoft", "sway.office.com", "www.sway.office.com"}
-
-
-def unwrap_redirect(candidate: str) -> str:
-    """Return the target of an Outlook Safe Links wrapper, else the URL unchanged."""
-    try:
-        parsed = urlsplit(candidate)
-    except ValueError:
-        return candidate
-    host = (parsed.hostname or "").lower()
-    if host.endswith(".safelinks.protection.outlook.com"):
-        target = parse_qs(parsed.query).get("url")
-        if target:
-            return target[0]
-    return candidate
-
-
 def canonical_sway_url(raw_url: str) -> str | None:
     candidate = html.unescape(raw_url or "").strip().rstrip(".,;:!?)]}")
-    candidate = unwrap_redirect(candidate).strip().rstrip(".,;:!?)]}")
     try:
         parsed = urlsplit(candidate)
-        if (parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() not in SWAY_HOSTS
+        if (parsed.scheme.lower() != "https" or parsed.hostname != "sway.cloud.microsoft"
                 or parsed.username or parsed.password or parsed.port not in (None, 443)
                 or not SWAY_ID_RE.fullmatch(parsed.path)):
             return None
@@ -268,25 +249,12 @@ def fetch_sway_content(context, url: str) -> tuple[str, str, str]:
                 pass
 
 
-def json_strings(value: Any):
-    """Yield every string inside a decoded JSON value."""
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for v in value.values():
-            yield from json_strings(v)
-    elif isinstance(value, list):
-        for v in value:
-            yield from json_strings(v)
-
-
 def sway_link_candidates(responses: list[dict[str, Any]],
                          detail_links: dict[str, list[str]] | None = None) -> list[tuple[str, str]]:
     """Return unique (message ID, canonical Sway URL) pairs for each message.
 
-    The body comes first. A newsletter link can also sit outside the body: in
-    another field of the conversation record (a link or button) or only on the
-    message page, so those are searched too.
+    The API gives the body as plain text, so a link behind words ("Click here
+    for The Anchor") is lost there and only appears on the message page.
     """
     candidates = []
     seen = set()
@@ -297,7 +265,7 @@ def sway_link_candidates(responses: list[dict[str, Any]],
             message = extract_message(item, None)
             if not message:
                 continue
-            sources = [message["body"], *json_strings(item), *(detail_links or {}).get(message["id"], [])]
+            sources = [message["body"], *(detail_links or {}).get(message["id"], [])]
             urls = []
             for source in sources:
                 for url in extract_sway_urls(source, limit=None):
