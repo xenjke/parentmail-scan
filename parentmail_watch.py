@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse, csv, datetime as dt, hashlib, html, io, json, os, posixpath, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile, zlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import quote, urljoin, urlparse, urlsplit
+from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
 from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -116,11 +116,30 @@ def extract_bounded_sway_text(page, limit=MAX_SWAY_TEXT_CHARS, timeout_ms=5_000,
     return rendered[:limit], truncated
 
 
-def canonical_sway_url(raw_url: str) -> str | None:
-    candidate = html.unescape(raw_url or "").strip().rstrip(".,;:!?)]}")
+# Sway documents are shared under both hosts with the same document IDs.
+SWAY_HOSTS = {"sway.cloud.microsoft", "sway.office.com", "www.sway.office.com"}
+
+
+def unwrap_redirect(candidate: str) -> str:
+    """Return the target of an Outlook Safe Links wrapper, else the URL unchanged."""
     try:
         parsed = urlsplit(candidate)
-        if (parsed.scheme.lower() != "https" or parsed.hostname != "sway.cloud.microsoft"
+    except ValueError:
+        return candidate
+    host = (parsed.hostname or "").lower()
+    if host.endswith(".safelinks.protection.outlook.com"):
+        target = parse_qs(parsed.query).get("url")
+        if target:
+            return target[0]
+    return candidate
+
+
+def canonical_sway_url(raw_url: str) -> str | None:
+    candidate = html.unescape(raw_url or "").strip().rstrip(".,;:!?)]}")
+    candidate = unwrap_redirect(candidate).strip().rstrip(".,;:!?)]}")
+    try:
+        parsed = urlsplit(candidate)
+        if (parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() not in SWAY_HOSTS
                 or parsed.username or parsed.password or parsed.port not in (None, 443)
                 or not SWAY_ID_RE.fullmatch(parsed.path)):
             return None
@@ -249,8 +268,26 @@ def fetch_sway_content(context, url: str) -> tuple[str, str, str]:
                 pass
 
 
-def sway_link_candidates(responses: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """Return unique (message ID, canonical Sway URL) pairs from message bodies."""
+def json_strings(value: Any):
+    """Yield every string inside a decoded JSON value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from json_strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from json_strings(v)
+
+
+def sway_link_candidates(responses: list[dict[str, Any]],
+                         detail_links: dict[str, list[str]] | None = None) -> list[tuple[str, str]]:
+    """Return unique (message ID, canonical Sway URL) pairs for each message.
+
+    The body comes first. A newsletter link can also sit outside the body: in
+    another field of the conversation record (a link or button) or only on the
+    message page, so those are searched too.
+    """
     candidates = []
     seen = set()
     for response in responses:
@@ -260,7 +297,13 @@ def sway_link_candidates(responses: list[dict[str, Any]]) -> list[tuple[str, str
             message = extract_message(item, None)
             if not message:
                 continue
-            for url in extract_sway_urls(message["body"]):
+            sources = [message["body"], *json_strings(item), *(detail_links or {}).get(message["id"], [])]
+            urls = []
+            for source in sources:
+                for url in extract_sway_urls(source, limit=None):
+                    if url not in urls:
+                        urls.append(url)
+            for url in urls[:MAX_SWAY_LINKS_PER_MESSAGE]:
                 key = (message["id"], url)
                 if key not in seen:
                     seen.add(key)
@@ -269,7 +312,7 @@ def sway_link_candidates(responses: list[dict[str, Any]]) -> list[tuple[str, str
 
 
 def collect_sway_links(responses: list[dict[str, Any]], context, cached_links=None, force=False,
-                       known_message_ids=None, recently_failed=None) -> list[dict[str, str]]:
+                       known_message_ids=None, recently_failed=None, detail_links=None) -> list[dict[str, str]]:
     """Read uncached public Sway links found in ParentMail message bodies.
 
     Links on messages not yet persisted are fetched first so stale failures on
@@ -281,7 +324,7 @@ def collect_sway_links(responses: list[dict[str, Any]], context, cached_links=No
     cached = set(cached_links or ())
     failed = set(recently_failed or ())
     known = set(known_message_ids or ())
-    candidates = [key for key in sway_link_candidates(responses) if force or key not in cached]
+    candidates = [key for key in sway_link_candidates(responses, detail_links) if force or key not in cached]
     candidates = [key for key in candidates if force or key[0] not in known or key not in failed]
     candidates.sort(key=lambda key: key[0] in known)
     found = []
@@ -673,6 +716,7 @@ def _login_and_collect(refresh_attachments=False, refresh_links=False):
             known = {r[0] for r in db.execute("select server_message_id from messages where server_message_id is not null")}
             db.close()
         attachments=[]
+        detail_links={}
         candidate_ids=[]
         for resp in responses:
             for item in resp.get("data",[]):
@@ -682,6 +726,11 @@ def _login_and_collect(refresh_attachments=False, refresh_links=False):
         for mid in dict.fromkeys(candidate_ids):
             page.goto("https://parents.parentmail.co.uk/messages/" + quote(mid, safe=""), wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(900)
+            # Every link on the message page, for newsletter links that are not in the API body.
+            try:
+                detail_links[mid]=[h for h in page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")[:200] if isinstance(h, str)]
+            except Exception:
+                debug("could not read links on a message page")
             for link in page.locator("a[href*='/download/']").all():
                 href=link.get_attribute("href") or ""
                 if not href: continue
@@ -721,11 +770,11 @@ def _login_and_collect(refresh_attachments=False, refresh_links=False):
             finally:
                 db.close()
         linked_content = []
-        candidates = sway_link_candidates(responses)
+        candidates = sway_link_candidates(responses, detail_links)
         pending = [key for key in candidates if refresh_links or key not in cached_links]
         if pending:
             link_options = {"force": refresh_links, "known_message_ids": known_message_ids,
-                            "recently_failed": recently_failed}
+                            "recently_failed": recently_failed, "detail_links": detail_links}
             sway_browser = None
             sway_context = None
             try:

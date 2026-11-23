@@ -295,6 +295,25 @@ class SwayPipelineTests(unittest.TestCase):
         self.assertEqual(collect_sway_links([response], FakeContext(page), cached_links=cached), [])
         self.assertEqual(len(collect_sway_links([response], FakeContext(page), cached_links=cached, force=True)), 1)
 
+    def test_finds_newsletter_links_outside_the_message_body(self):
+        url = "https://sway.cloud.microsoft/AbCdEf1234567890"
+        in_field = {"id": "m-field", "title": "Anchor Issue 4",
+                    "last_message": {"id": "m-field", "content": "Our latest newsletter is here.",
+                                     "links": [{"title": "Read it", "url": url + "?ref=Link"}]}}
+        on_page = {"id": "m-page", "title": "Anchor Issue 5",
+                   "last_message": {"id": "m-page", "content": "Our latest newsletter is here."}}
+        page_links = {"m-page": ["https://parents.parentmail.co.uk/messages", url.replace("AbCdEf", "ZyXwVu")]}
+        self.assertEqual(parentmail_watch.sway_link_candidates([{"data": [in_field, on_page]}], page_links),
+                         [("m-field", url), ("m-page", url.replace("AbCdEf", "ZyXwVu"))])
+
+    def test_accepts_office_host_and_safe_links_wrapper(self):
+        url = "https://sway.cloud.microsoft/AbCdEf1234567890"
+        self.assertEqual(canonical_sway_url("https://sway.office.com/AbCdEf1234567890?ref=Link"), url)
+        wrapped = ("https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fsway.cloud.microsoft"
+                   "%2FAbCdEf1234567890%3Fref%3DLink&data=x")
+        self.assertEqual(canonical_sway_url(wrapped), url)
+        self.assertIsNone(canonical_sway_url("https://evil.example/?url=https%3A%2F%2Fsway.cloud.microsoft%2FAbCdEf1234567890"))
+
     def _responses(self, *pairs):
         return [{"data": [{"id": mid, "title": f"Message {mid}",
                            "last_message": {"id": mid, "content": f"Read {url}"}} for mid, url in pairs]}]
