@@ -62,10 +62,14 @@ SWAY_ID_RE = re.compile(r"^/[A-Za-z0-9_-]{8,64}/?$")
 SWAY_RESOURCE_HOSTS = {
     "sway.cloud.microsoft",
     "eus-cdn.sway.static.microsoft",
+    "wcus-cdn.sway.static.microsoft",
     "cdn.sway.static.microsoft",
     "wcpstatic.microsoft.com",
 }
 MAX_SWAY_LINKS_PER_MESSAGE = 3
+MAX_DETAIL_ANCHORS = 100
+MAX_DETAIL_DOM_NODES = 20_000
+MAX_DETAIL_HREF_CHARS = 2_048
 MAX_SWAY_FETCHES_PER_RUN = 3
 MAX_SWAY_TEXT_CHARS = 40_000
 MAX_SWAY_TITLE_CHARS = 200
@@ -249,10 +253,57 @@ def fetch_sway_content(context, url: str) -> tuple[str, str, str]:
                 pass
 
 
-def sway_link_candidates(responses: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """Return unique (message ID, canonical Sway URL) pairs from message bodies."""
+def collect_detail_sway_links(page, message_id: str) -> list[tuple[str, str]]:
+    """Read bounded anchors from the exact authenticated message-detail page.
+
+    Prefer a message-body container, otherwise main/body, ignoring navigation.
+    Return canonical (message ID, URL) pairs without following links or changing
+    the conversation-list body/hash. A redirected/wrong detail page yields none.
+    """
+    try:
+        source = urlsplit(page.url)
+        if (not message_id or source.scheme != "https" or source.hostname != "parents.parentmail.co.uk"
+                or source.username or source.password or source.port not in (None, 443)
+                or source.path != "/messages/" + quote(str(message_id), safe="")):
+            return []
+    except ValueError:
+        return []
+    hrefs = page.locator("body").evaluate(r"""(body, opts) => {
+      const root = body.querySelector('[data-testid="message-body"], .message-body, .message-content')
+        || body.querySelector('main') || body;
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      const hrefs = []; let node, visited = 0, anchors = 0;
+      while (visited < opts.max_nodes && anchors < opts.max_anchors && (node = walker.nextNode())) {
+        visited++;
+        if (!node.matches('a[href]')) continue;
+        anchors++;
+        if (node.closest('nav,aside,header,footer,script,style,template')) continue;
+        const href = node.getAttribute('href') || '';
+        if (href.length <= opts.max_href_chars) hrefs.push(href);
+      }
+      return hrefs;
+    }""", {"max_nodes": MAX_DETAIL_DOM_NODES, "max_anchors": MAX_DETAIL_ANCHORS,
+           "max_href_chars": MAX_DETAIL_HREF_CHARS}, timeout=5_000)
+    found = []
+    for href in hrefs:
+        canonical = canonical_sway_url(href)
+        key = (str(message_id), canonical)
+        if canonical and key not in found:
+            found.append(key)
+        if len(found) >= MAX_SWAY_LINKS_PER_MESSAGE:
+            break
+    return found
+
+
+def sway_link_candidates(responses: list[dict[str, Any]],
+                         detail_candidates: list[tuple[str, str]] | None = None, *,
+                         excluded_links=None) -> list[tuple[str, str]]:
+    """Return bounded candidates; cached exclusions do not consume the link budget."""
     candidates = []
     seen = set()
+    excluded = set(excluded_links or ())
+    message_ids = set()
+    counts = {}
     for response in responses:
         for item in response.get("data", []):
             if not isinstance(item, dict):
@@ -260,17 +311,30 @@ def sway_link_candidates(responses: list[dict[str, Any]]) -> list[tuple[str, str
             message = extract_message(item, None)
             if not message:
                 continue
+            message_id = message["id"]
+            message_ids.add(message_id)
             for url in extract_sway_urls(message["body"]):
-                key = (message["id"], url)
-                if key not in seen:
+                key = (message_id, url)
+                if key not in excluded and key not in seen and counts.get(message_id, 0) < MAX_SWAY_LINKS_PER_MESSAGE:
                     seen.add(key)
                     candidates.append(key)
+                    counts[message_id] = counts.get(message_id, 0) + 1
+    for message_id, url in detail_candidates or ():
+        message_id = str(message_id)
+        canonical = canonical_sway_url(url)
+        key = (message_id, canonical)
+        if (message_id in message_ids and canonical and key not in excluded and key not in seen
+                and counts.get(message_id, 0) < MAX_SWAY_LINKS_PER_MESSAGE):
+            seen.add(key)
+            candidates.append(key)
+            counts[message_id] = counts.get(message_id, 0) + 1
     return candidates
 
 
 def collect_sway_links(responses: list[dict[str, Any]], context, cached_links=None, force=False,
-                       known_message_ids=None, recently_failed=None) -> list[dict[str, str]]:
-    """Read uncached public Sway links found in ParentMail message bodies.
+                       known_message_ids=None, recently_failed=None, *,
+                       detail_candidates: list[tuple[str, str]] | None = None) -> list[dict[str, str]]:
+    """Read uncached public Sway links found in message bodies and detail anchors.
 
     Links on messages not yet persisted are fetched first so stale failures on
     older messages cannot starve them of the per-run budget. Links on older
@@ -281,15 +345,17 @@ def collect_sway_links(responses: list[dict[str, Any]], context, cached_links=No
     cached = set(cached_links or ())
     failed = set(recently_failed or ())
     known = set(known_message_ids or ())
-    candidates = [key for key in sway_link_candidates(responses) if force or key not in cached]
+    detail_candidates = list(detail_candidates or ())
+    detail_keys = {(str(mid), canonical_sway_url(url)) for mid, url in detail_candidates}
+    candidates = sway_link_candidates(responses, detail_candidates, excluded_links=() if force else cached)
     candidates = [key for key in candidates if force or key[0] not in known or key not in failed]
     candidates.sort(key=lambda key: key[0] in known)
     found = []
     fetched = 0
     for message_id, url in candidates:
         if fetched >= MAX_SWAY_FETCHES_PER_RUN:
-            if message_id in known:
-                break
+            if message_id in known and ((message_id, url) not in detail_keys or (message_id, url) in cached):
+                continue
             found.append({"message_id": message_id, "url": url, "title": "",
                           "extracted_text": "", "extraction_method": SWAY_NOT_ATTEMPTED})
             continue
@@ -664,24 +730,29 @@ def _login_and_collect(refresh_attachments=False, refresh_links=False):
         if result.get("responses"): responses.extend(result["responses"])
         debug(f"conversation capture responses={len(responses)} browser_fetch_responses={len(result.get('responses', []))} keys={result.get('keys', [])}")
         phase("collect_attachments")
-        # Visit detail pages in the same authenticated browser context to collect
-        # attachment links. By default only unknown message IDs are opened; the
-        # refresh flag is for a controlled migration/backfill run.
+        # Visit message details in the authenticated ParentMail context. Either
+        # refresh flag may reopen known IDs, but link refresh must not redownload
+        # their attachments. Keep discovered URLs separate from canonical bodies.
         known = set()
-        if not refresh_attachments and DB.exists():
+        if DB.exists():
             db = sqlite3.connect(DB)
-            known = {r[0] for r in db.execute("select server_message_id from messages where server_message_id is not null")}
+            known = {str(r[0]) for r in db.execute("select server_message_id from messages where server_message_id is not null")}
             db.close()
         attachments=[]
+        detail_candidates=[]
         candidate_ids=[]
         for resp in responses:
             for item in resp.get("data",[]):
                 if isinstance(item,dict):
-                    mid=item.get("id") or item.get("uuid")
-                    if mid and (refresh_attachments or mid not in known): candidate_ids.append(str(mid))
+                    message = extract_message(item, None)
+                    if message and (refresh_attachments or refresh_links or message["id"] not in known):
+                        candidate_ids.append(message["id"])
         for mid in dict.fromkeys(candidate_ids):
             page.goto("https://parents.parentmail.co.uk/messages/" + quote(mid, safe=""), wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(900)
+            detail_candidates.extend(collect_detail_sway_links(page, mid))
+            if mid in known and not refresh_attachments:
+                continue
             for link in page.locator("a[href*='/download/']").all():
                 href=link.get_attribute("href") or ""
                 if not href: continue
@@ -711,9 +782,12 @@ def _login_and_collect(refresh_attachments=False, refresh_links=False):
                 for message_id, source_url, method, last_seen in db.execute(
                         "select message_id,source_url,extraction_method,last_seen_at from message_links"):
                     key = (str(message_id), str(source_url))
+                    # Detail-only URLs must survive normal-run detail skips so
+                    # budget-limited and failed reads can complete on later runs.
+                    detail_candidates.append(key)
                     if method in SWAY_SUCCESS_METHODS:
                         cached_links.add(key)
-                    elif (last_seen or "") >= retry_cutoff:
+                    elif method != SWAY_NOT_ATTEMPTED and (last_seen or "") >= retry_cutoff:
                         recently_failed.add(key)
             except sqlite3.OperationalError:
                 # Existing installations gain the link cache on this run.
@@ -721,11 +795,11 @@ def _login_and_collect(refresh_attachments=False, refresh_links=False):
             finally:
                 db.close()
         linked_content = []
-        candidates = sway_link_candidates(responses)
-        pending = [key for key in candidates if refresh_links or key not in cached_links]
+        pending = sway_link_candidates(responses, detail_candidates,
+                                       excluded_links=() if refresh_links else cached_links)
         if pending:
             link_options = {"force": refresh_links, "known_message_ids": known_message_ids,
-                            "recently_failed": recently_failed}
+                            "recently_failed": recently_failed, "detail_candidates": detail_candidates}
             sway_browser = None
             sway_context = None
             try:
@@ -807,8 +881,8 @@ def persist(responses, attachments=None, dry_run=False, *, linked_content=None):
             fingerprint = fingerprints.get(message_id)
             if not message_id or not source_url or not fingerprint:
                 continue
-            if link.get("extraction_method") == SWAY_NOT_ATTEMPTED:
-                continue
+            # Retain not-attempted URLs as pending, without making their known
+            # ParentMail message eligible for another notification.
             extracted = str(link.get("extracted_text") or "")[:MAX_SWAY_TEXT_CHARS]
             content_hash = hash_text(extracted)
             link_id = hash_text(message_id + "\\n" + source_url)
