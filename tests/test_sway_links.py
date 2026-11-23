@@ -118,6 +118,19 @@ class SwayLinkTests(unittest.TestCase):
         self.assertFalse(is_allowed_sway_resource("https://example.com/id"))
         self.assertFalse(is_allowed_sway_resource("https://sway.cloud.microsoft:8443/id"))
 
+    def test_wcus_sway_cdn_allows_only_exact_https_textual_resources(self):
+        document = "https://sway.cloud.microsoft/AnchorIssue42026"
+        script = "https://wcus-cdn.sway.static.microsoft/sway/v1/trusted-types-policies.js"
+        self.assertTrue(is_allowed_sway_request(script, "script", document))
+        self.assertTrue(is_allowed_sway_request(script.replace(".js", ".css"), "stylesheet", document))
+        for resource_type in ("image", "media", "font", "document"):
+            self.assertFalse(is_allowed_sway_request(script, resource_type, document))
+        for bad in (script.replace("https:", "http:"),
+                    script.replace("wcus-cdn.sway.static.microsoft", "wcus-cdn.sway.static.microsoft.evil.test"),
+                    script.replace("wcus-cdn.sway.static.microsoft", "other-cdn.sway.static.microsoft"),
+                    script.replace("wcus-cdn.sway.static.microsoft", "wcus-cdn.sway.static.microsoft:8443")):
+            self.assertFalse(is_allowed_sway_request(bad, "script", document))
+
     def test_route_policy_only_allows_original_document_and_textual_sway_resources(self):
         original = "https://sway.cloud.microsoft/AbCdEf1234567890"
         self.assertTrue(is_allowed_sway_request(original, "document", original))
