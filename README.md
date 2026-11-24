@@ -14,21 +14,35 @@ Deterministic, read-only IRIS ParentMail monitor for Home Assistant/Hermes cron.
 
 - Python 3.11+
 - Playwright Python package and a Chromium executable
-- `pypdf` for PDF extraction
-- Pillow and Tesseract with English language data for text embedded as images in DOCX
+- `pypdf` for PDF text layers
+- Poppler (`pdftoppm`) for rendering scanned PDF pages
+- Pillow and Tesseract with English language data for scanned PDF pages and images in DOCX
 
 Example:
 
 ```bash
 python -m pip install playwright pypdf pillow
 playwright install chromium
-# Install Tesseract separately: Arch `sudo pacman -S tesseract tesseract-data-eng`
-# or macOS `brew install tesseract`.
+# Install native tools separately: Arch `sudo pacman -S poppler tesseract tesseract-data-eng`
+# or macOS `brew install poppler tesseract`.
 ```
 
 The production Hermes environment already provides Playwright and Chromium through its runtime.
 It currently also has Pillow and `tesseract`/English data. Check after a runtime upgrade:
 `python -c 'from PIL import Image; print(Image.__version__)'` and `tesseract --list-langs`.
+Also verify `pdftoppm -v` for scanned PDFs.
+
+PDF extraction keeps native text and OCRs pages with content but no text layer,
+including image-only pages in mixed documents. Rendering is local: no private
+attachment is uploaded to an OCR service. Grayscale plus two skew probes (±20°)
+help recover colored menus and tilted date/time stamps. OCR is limited to four
+pages, with a 45-second soft document start budget, a 30-second per-page budget,
+15-second subprocess limits, 2200-pixel render dimensions and 10,000 output
+characters per OCR page. The in-flight page may finish after the document start
+budget. Missing tools, failed OCR and skipped/truncated pages produce explicit
+`pypdf+ocr-incomplete` markers; existing native text is retained. OCR is not a
+guarantee of accuracy, and pages with any native text currently use that text
+without OCRing additional pictures on the same page.
 
 DOCX extraction preserves paragraph/table-cell text and OCRs embedded screenshot
 tables in document order. Transparent images are composited onto white before OCR.

@@ -437,6 +437,11 @@ def visible_docx_nodes(node: ET.Element):
         yield from visible_docx_nodes(child)
 
 
+MAX_PDF_OCR_PAGES = 4
+MAX_PDF_OCR_SECONDS = 45
+MAX_PDF_OCR_PAGE_SECONDS = 30
+
+
 def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple[str, str]:
     """Extract searchable text without rejecting non-PDF attachments."""
     lower_name = filename.lower()
@@ -444,8 +449,35 @@ def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple
     if mime == "application/pdf" or lower_name.endswith(".pdf"):
         try:
             from pypdf import PdfReader
-            extracted = "\\n".join((page.extract_text() or "") for page in PdfReader(io.BytesIO(data)).pages).strip()
-            return extracted, "pypdf"
+            parts = []
+            used_ocr = False
+            incomplete = False
+            ocr_pages = 0
+            ocr_started = time.monotonic()
+            for page_number, page in enumerate(PdfReader(io.BytesIO(data)).pages, 1):
+                try:
+                    native = (page.extract_text() or "").strip()
+                    has_content = not native and page.get_contents() is not None
+                except Exception:
+                    native = ""
+                    has_content = True
+                if native:
+                    parts.append(native)
+                elif has_content:
+                    used_ocr = True
+                    if (ocr_pages >= MAX_PDF_OCR_PAGES
+                            or time.monotonic() - ocr_started >= MAX_PDF_OCR_SECONDS):
+                        recovered, complete = "", False
+                    else:
+                        ocr_pages += 1
+                        recovered, complete = ocr_pdf_page(data, page_number)
+                    if recovered:
+                        parts.append(f"[PDF page {page_number} OCR]\n{recovered}\n[/PDF page {page_number} OCR]")
+                    if not recovered or not complete:
+                        incomplete = True
+                        parts.append(f"[PDF page {page_number}: OCR unavailable, unreadable or truncated; check original attachment]")
+            method = "pypdf+ocr-incomplete" if incomplete else "pypdf+ocr" if used_ocr else "pypdf"
+            return "\n".join(parts).strip(), method
         except Exception:
             return "", "unavailable_or_failed"
     if (mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -535,8 +567,53 @@ def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple
     return "", "unsupported_format"
 
 
-def ocr_docx_image(data: bytes) -> tuple[str, bool]:
-    """OCR an embedded screenshot, returning (text, complete)."""
+def ocr_pdf_page(data: bytes, page_number: int) -> tuple[str, bool]:
+    """Render one local PDF page before applying the existing bounded image OCR."""
+    renderer = shutil.which("pdftoppm")
+    if not renderer:
+        return "", False
+    deadline = time.monotonic() + MAX_PDF_OCR_PAGE_SECONDS
+    try:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
+            source = Path(directory) / "source.pdf"
+            prefix = Path(directory) / "page"
+            source.write_bytes(data)
+            result = subprocess.run(
+                [renderer, "-f", str(page_number), "-l", str(page_number), "-singlefile",
+                 "-scale-to", "2200", "-png", str(source), str(prefix)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False,
+            )
+            image = prefix.with_suffix(".png")
+            if result.returncode or not image.is_file() or image.stat().st_size > 12_000_000:
+                return "", False
+            from PIL import Image, ImageOps
+
+            with Image.open(image) as rendered:
+                gray = ImageOps.grayscale(rendered)
+            parts = []
+            complete = True
+            # Colored flyers and tilted date stamps can defeat the default
+            # binarizer. Keep the ordinary pass plus two bounded skew probes.
+            for angle in (0, -20, 20):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    complete = False
+                    break
+                variant = gray.rotate(angle, expand=True, fillcolor=255) if angle else gray
+                encoded = io.BytesIO()
+                variant.save(encoded, format="PNG")
+                recovered, pass_complete = ocr_docx_image(encoded.getvalue(), timeout=min(15, remaining), allow_empty=True)
+                complete = complete and pass_complete
+                if recovered:
+                    parts.append(recovered if not angle else f"[Skew recovery {angle:+d} degrees]\n{recovered}")
+            recovered = "\n".join(parts)
+            return recovered[:10_000], bool(recovered) and complete and len(recovered) <= 10_000
+    except Exception:
+        return "", False
+
+
+def ocr_docx_image(data: bytes, *, timeout: float = 15, allow_empty: bool = False) -> tuple[str, bool]:
+    """OCR an embedded screenshot; allow successful no-word PDF skew probes."""
     if not shutil.which("tesseract"):
         return "", False
     try:
@@ -554,7 +631,7 @@ def ocr_docx_image(data: bytes) -> tuple[str, bool]:
             result = subprocess.run(
                 ["tesseract", "stdin", "stdout", "--psm", "11", "-l", "eng", "tsv"],
                 input=image_bytes.getvalue(), stdout=output, stderr=subprocess.DEVNULL,
-                timeout=15, check=False,
+                timeout=timeout, check=False,
             )
             if result.returncode or output.tell() > 2_000_000:
                 return "", False
@@ -563,14 +640,14 @@ def ocr_docx_image(data: bytes) -> tuple[str, bool]:
         # PSM 11 reads faint/highlighted table rows missed by PSM 3, but its
         # plain-text output can scramble cell order. Rebuild rows from boxes.
         boxes = []
-        for box in csv.DictReader(io.StringIO(tsv), delimiter="\t"):
+        for box in csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE):
             word = text(box.get("text"))
             if word:
                 if len(boxes) >= 4_000:
                     return "", False
                 boxes.append((int(box["left"]), int(box["top"]), int(box["width"]), int(box["height"]), word))
         if not boxes:
-            return "", False
+            return "", allow_empty
         heights = sorted(box[3] for box in boxes)
         median_height = heights[len(heights) // 2]
         line_tolerance = max(8, median_height // 2)
