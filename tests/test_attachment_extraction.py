@@ -323,7 +323,7 @@ class AttachmentExtractionTests(unittest.TestCase):
         writer.add_blank_page(width=200, height=200)
         writer.write(output)
         self.assertEqual(extract_attachment_text(output.getvalue(), "page.pdf", "application/pdf"), ("", "pypdf"))
-        self.assertEqual(extract_attachment_text(b"data", "page.png", "image/png"), ("", "unsupported_format"))
+        self.assertEqual(extract_attachment_text(b"data", "page.gif", "image/gif"), ("", "unsupported_format"))
 
     @unittest.skipUnless(os.environ.get("PARENTMAIL_TEST_DOCX"), "private DOCX fixture not provided")
     def test_private_forest_school_table_has_all_week_labels(self):

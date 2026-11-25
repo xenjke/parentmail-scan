@@ -440,6 +440,7 @@ def visible_docx_nodes(node: ET.Element):
 MAX_PDF_OCR_PAGES = 4
 MAX_PDF_OCR_SECONDS = 45
 MAX_PDF_OCR_PAGE_SECONDS = 30
+MAX_IMAGE_OCR_BYTES = 8_000_000
 
 
 def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple[str, str]:
@@ -542,7 +543,7 @@ def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple
                             except KeyError:
                                 pass
                             else:
-                                if member.file_size <= 8_000_000:
+                                if member.file_size <= MAX_IMAGE_OCR_BYTES:
                                     try:
                                         image_data = archive.read(member)
                                     except Exception:
@@ -564,6 +565,17 @@ def extract_attachment_text(data: bytes, filename: str, mime_type: str) -> tuple
             return "\n".join(part for part in parts if part), method
         except Exception:
             return "", "unavailable_or_failed"
+    if mime in ("image/jpeg", "image/png") or lower_name.endswith((".jpg", ".jpeg", ".png")):
+        if len(data) > MAX_IMAGE_OCR_BYTES:
+            return "", "image-ocr-incomplete"
+        recovered, complete = ocr_docx_image(
+            data, formats=("JPEG", "PNG"), reject_animated_png=True,
+        )
+        if complete:
+            return recovered, "image-ocr"
+        if recovered:
+            recovered += "\n[Image OCR text truncated; check original attachment]"
+        return recovered, "image-ocr-incomplete"
     return "", "unsupported_format"
 
 
@@ -612,14 +624,19 @@ def ocr_pdf_page(data: bytes, page_number: int) -> tuple[str, bool]:
         return "", False
 
 
-def ocr_docx_image(data: bytes, *, timeout: float = 15, allow_empty: bool = False) -> tuple[str, bool]:
-    """OCR an embedded screenshot; allow successful no-word PDF skew probes."""
+def ocr_docx_image(
+    data: bytes, *, timeout: float = 15, allow_empty: bool = False,
+    formats: tuple[str, ...] | None = None, reject_animated_png: bool = False,
+) -> tuple[str, bool]:
+    """Shared raster OCR with optional restrictions for standalone attachments."""
     if not shutil.which("tesseract"):
         return "", False
     try:
         from PIL import Image
 
-        with Image.open(io.BytesIO(data)) as image:
+        with Image.open(io.BytesIO(data), formats=formats) as image:
+            if reject_animated_png and image.get_format_mimetype() == "image/apng":
+                return "", False
             if image.width * image.height > 12_000_000:
                 return "", False
             rgba = image.convert("RGBA")
@@ -628,10 +645,13 @@ def ocr_docx_image(data: bytes, *, timeout: float = 15, allow_empty: bool = Fals
         image_bytes = io.BytesIO()
         background.convert("RGB").save(image_bytes, format="PNG")
         with tempfile.TemporaryFile(dir=os.environ.get("TMPDIR")) as output:
+            ocr_env = os.environ.copy()
+            ocr_env.pop("PARENTMAIL_EMAIL", None)
+            ocr_env.pop("PARENTMAIL_PASSWORD", None)
             result = subprocess.run(
                 ["tesseract", "stdin", "stdout", "--psm", "11", "-l", "eng", "tsv"],
                 input=image_bytes.getvalue(), stdout=output, stderr=subprocess.DEVNULL,
-                timeout=timeout, check=False,
+                timeout=timeout, check=False, env=ocr_env,
             )
             if result.returncode or output.tell() > 2_000_000:
                 return "", False
