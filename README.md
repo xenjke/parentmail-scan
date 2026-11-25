@@ -16,7 +16,7 @@ Deterministic, read-only IRIS ParentMail monitor for Home Assistant/Hermes cron.
 - Playwright Python package and a Chromium executable
 - `pypdf` for PDF text layers
 - Poppler (`pdftoppm`) for rendering scanned PDF pages
-- Pillow and Tesseract with English language data for scanned PDF pages and images in DOCX
+- Pillow and Tesseract with English language data for scanned PDF pages, images in DOCX, and JPEG/PNG attachments
 
 Example:
 
@@ -49,6 +49,15 @@ tables in document order. Transparent images are composited onto white before OC
 If an embedded image is unreadable, too large, or the OCR dependencies are missing,
 the text includes an explicit incomplete-OCR marker instead of claiming no dates exist.
 Images are limited in count/size and OCR has a per-image timeout.
+
+Standalone JPEG and static PNG attachments use the same local OCR pipeline,
+including white compositing for transparent PNGs. The collector selects them by
+MIME type or extension and only decodes JPEG/PNG contents. On this route, animated
+PNGs (APNG) are saved unchanged and marked `image-ocr-incomplete` without OCR.
+OCR is limited to 8 MB of input, 12 million pixels, 15 seconds for Tesseract and
+10,000 recognized characters per image. Originals are still saved if OCR fails.
+`image-ocr-incomplete` also identifies unreadable or truncated results; partial
+text is kept and flagged in the output.
 
 Public Microsoft Sway links in ParentMail message bodies are rendered in a separate,
 ephemeral Playwright context with service workers disabled. The fetch is restricted
